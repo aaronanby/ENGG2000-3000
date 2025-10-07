@@ -1,0 +1,253 @@
+/* The true ESP32 chip ID is essentially its MAC address.
+This sketch provides an alternate chip ID that matches
+the output of the ESP.getChipId() function on ESP8266
+(i.e. a 32-bit integer matching the last 3 bytes of
+the MAC address. This is less unique than the
+MAC address chip ID, but is helpful when you need
+an identifier that can be no more than a 32-bit integer
+(like for switch...case).
+
+created 2020-06-07 by cweinhofer
+with help from Cicicok */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+uint32_t chipId = 0;
+
+void setup() {
+  Serial.begin(115200);
+}
+
+void loop() {
+  for (int i = 0; i < 17; i = i + 8) {
+    chipId |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
+  }
+
+  Serial.printf("ESP32 Chip model = %s Rev %d\n", ESP.getChipModel(), ESP.getChipRevision());
+  Serial.printf("This chip has %d cores\n", ESP.getChipCores());
+  Serial.print("Chip ID: ");
+  Serial.println(chipId);
+
+  delay(3000);
+}
+
+
+// WiFi credentials
+const char* ssid = "Group62";
+const char* password = "systems62";
+
+
+// Create web server on port 80
+WebServer server(80);
+
+// Servo setup
+Servo bridgeServo1;
+Servo bridgeServo2;
+const int servo1Pin = 18;
+const int servo2Pin = 19;
+
+// IR sensor pins
+const int irSensor1Pin = 2;
+const int irSensor2Pin = 4;
+
+// Motor driver pins
+const int motorPin1 = 16;
+const int motorPin2 = 17;
+const int motorEnablePin = 5;
+
+// Bridge state
+bool bridgeOpen = false;
+const int closedPosition = 0;   // 0 degrees when closed
+const int openPosition = 90;    // 90 degrees when open
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Initialize pins
+  pinMode(irSensor1Pin, INPUT);
+  pinMode(irSensor2Pin, INPUT);
+  pinMode(motorPin1, OUTPUT);
+  pinMode(motorPin2, OUTPUT);
+  pinMode(motorEnablePin, OUTPUT);
+  
+  // Initialize servos
+  bridgeServo1.attach(servo1Pin);
+  bridgeServo2.attach(servo2Pin);
+  
+  // Set initial bridge position (closed)
+  bridgeServo1.write(closedPosition);
+  bridgeServo2.write(closedPosition);
+  
+  // Scan and connect to WiFi
+  scanAndConnectWiFi();
+  
+  // Setup web server routes
+  setupWebServer();
+  
+  Serial.println("ESP32 Bridge Controller Ready!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  server.handleClient();
+  
+  // Check IR sensors for automatic bridge operation
+  bool sensor1Active = digitalRead(irSensor1Pin);
+  bool sensor2Active = digitalRead(irSensor2Pin);
+  
+  if (sensor1Active || sensor2Active) {
+    if (!bridgeOpen) {
+      openBridge();
+      delay(5000); // Keep bridge open for 5 seconds
+      closeBridge();
+    }
+  }
+  
+  delay(100);
+}
+
+void scanAndConnectWiFi() {
+  Serial.println("Scanning for WiFi networks...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  
+  int n = WiFi.scanNetworks();
+  Serial.println("Scan complete");
+  
+  if (n == 0) {
+    Serial.println("No networks found");
+  } else {
+    Serial.print(n);
+    Serial.println(" networks found:");
+    
+    for (int i = 0; i < n; ++i) {
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.print(WiFi.SSID(i));
+      Serial.print(" (");
+      Serial.print(WiFi.RSSI(i));
+      Serial.print(")");
+      Serial.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? " " : "*");
+      delay(10);
+    }
+  }
+  Serial.println("");
+  
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("");
+    Serial.println("Failed to connect to WiFi");
+  }
+}
+
+void setupWebServer() {
+  // Main control page
+  server.on("/", handleRoot);
+  
+  // Bridge control endpoints
+  server.on("/open", handleOpenBridge);
+  server.on("/close", handleCloseBridge);
+  server.on("/status", handleStatus);
+  
+  // Start server
+  server.begin();
+  Serial.println("Web server started");
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Bridge Controller</title>";
+  html += "<style>body{font-family:Arial;text-align:center;margin:50px;}";
+  html += "button{padding:20px;font-size:18px;margin:10px;background:#4CAF50;color:white;border:none;border-radius:5px;cursor:pointer;}";
+  html += "button:hover{background:#45a049;}</style></head><body>";
+  html += "<h1>ESP32 Bridge Controller</h1>";
+  html += "<h2>Bridge Status: " + String(bridgeOpen ? "OPEN" : "CLOSED") + "</h2>";
+  html += "<button onclick=\"location.href='/open'\">OPEN BRIDGE</button>";
+  html += "<button onclick=\"location.href='/close'\">CLOSE BRIDGE</button>";
+  html += "<br><br><button onclick=\"location.href='/status'\">CHECK STATUS</button>";
+  html += "<script>setInterval(function(){location.reload();},5000);</script>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleOpenBridge() {
+  openBridge();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleCloseBridge() {
+  closeBridge();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleStatus() {
+  String status = "{";
+  status += "\"bridgeOpen\":" + String(bridgeOpen ? "true" : "false") + ",";
+  status += "\"sensor1\":" + String(digitalRead(irSensor1Pin) ? "true" : "false") + ",";
+  status += "\"sensor2\":" + String(digitalRead(irSensor2Pin) ? "true" : "false") + ",";
+  status += "\"wifi_strength\":" + String(WiFi.RSSI());
+  status += "}";
+  
+  server.send(200, "application/json", status);
+}
+
+void openBridge() {
+  Serial.println("Opening bridge...");
+  bridgeOpen = true;
+  
+  // Move servos to open position
+  bridgeServo1.write(openPosition);
+  bridgeServo2.write(openPosition);
+  
+  // Run motor to assist opening (optional)
+  digitalWrite(motorPin1, HIGH);
+  digitalWrite(motorPin2, LOW);
+  digitalWrite(motorEnablePin, HIGH);
+  delay(2000); // Run motor for 2 seconds
+  digitalWrite(motorEnablePin, LOW);
+  
+  Serial.println("Bridge opened");
+}
+
+void closeBridge() {
+  Serial.println("Closing bridge...");
+  bridgeOpen = false;
+  
+  // Move servos to closed position
+  bridgeServo1.write(closedPosition);
+  bridgeServo2.write(closedPosition);
+  
+  // Run motor in reverse to assist closing (optional)
+  digitalWrite(motorPin1, LOW);
+  digitalWrite(motorPin2, HIGH);
+  digitalWrite(motorEnablePin, HIGH);
+  delay(2000); // Run motor for 2 seconds
+  digitalWrite(motorEnablePin, LOW);
+  
+  Serial.println("Bridge closed");
+}
+
